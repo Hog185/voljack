@@ -25,7 +25,7 @@ out0 ... outN
 
 # Features
 
-- extremely lightweight JACK client
+- JACK client
 - any number of channels
 - one shared volume control
 - dB-based gain control
