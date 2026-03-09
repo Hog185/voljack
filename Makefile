@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O3 -DNDEBUG -Wall -Wextra -Wpedantic
+CFLAGS ?= -std=c11 -O3 -DNDEBUG -Wall -Wextra -Wpedantic
 CPPFLAGS += $(shell pkg-config --cflags jack)
 LDLIBS += $(shell pkg-config --libs jack) -lm
 

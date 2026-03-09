@@ -8,6 +8,7 @@
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,8 +16,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <unistd.h>
 #include <time.h>
+#include <unistd.h>
 
 #define DEFAULT_CHANNELS 2
 #define DEFAULT_MIN_DB   (-INFINITY)
@@ -46,10 +47,15 @@ typedef struct {
 
 	int channels;
 
-	// control state
-	volatile sig_atomic_t db_is_neg_inf;
-	volatile float current_db;
-	volatile float target_gain;
+	/* shared control state:
+	 * - written by control thread
+	 * - read by JACK RT callback
+	 */
+	atomic_int db_is_neg_inf;
+	_Atomic float current_db;
+	_Atomic float target_gain;
+
+	/* only touched by JACK process callback */
 	float current_gain;
 
 	float min_db;
@@ -140,21 +146,21 @@ static float clampf_local(float v, float lo, float hi) {
 
 static void apply_db(app_t *app, int is_neg_inf, float db) {
 	if (is_neg_inf) {
-		app->db_is_neg_inf = 1;
-		app->current_db = -INFINITY;
-		app->target_gain = 0.0f;
+		atomic_store_explicit(&app->db_is_neg_inf, 1, memory_order_relaxed);
+		atomic_store_explicit(&app->current_db, -INFINITY, memory_order_relaxed);
+		atomic_store_explicit(&app->target_gain, 0.0f, memory_order_relaxed);
 		return;
 	}
 
 	db = clampf_local(db, app->min_db, app->max_db);
-	app->db_is_neg_inf = 0;
-	app->current_db = db;
-	app->target_gain = db_to_gain(0, db);
+	atomic_store_explicit(&app->db_is_neg_inf, 0, memory_order_relaxed);
+	atomic_store_explicit(&app->current_db, db, memory_order_relaxed);
+	atomic_store_explicit(&app->target_gain, db_to_gain(0, db), memory_order_relaxed);
 }
 
 static void set_initial_db(app_t *app, int is_neg_inf, float db) {
 	apply_db(app, is_neg_inf, db);
-	app->current_gain = app->target_gain;
+	app->current_gain = atomic_load_explicit(&app->target_gain, memory_order_relaxed);
 }
 
 static void config_defaults(config_t *cfg) {
@@ -288,7 +294,7 @@ static int process_cb(jack_nframes_t nframes, void *arg) {
 	app_t *app = (app_t *)arg;
 
 	float gain = app->current_gain;
-	float target = app->target_gain;
+	float target = atomic_load_explicit(&app->target_gain, memory_order_relaxed);
 	float step = 0.0f;
 
 	if (nframes > 1) {
@@ -384,7 +390,9 @@ static void handle_command(app_t *app, const char *cmd, int fd) {
 
 	if (strcmp(tmp, "get") == 0) {
 		char dbbuf[64], out[128];
-		format_db(dbbuf, sizeof(dbbuf), app->db_is_neg_inf, app->current_db);
+		int is_neg_inf = atomic_load_explicit(&app->db_is_neg_inf, memory_order_relaxed);
+		float current_db = atomic_load_explicit(&app->current_db, memory_order_relaxed);
+		format_db(dbbuf, sizeof(dbbuf), is_neg_inf, current_db);
 		snprintf(out, sizeof(out), "%s dB\n", dbbuf);
 		send_reply(fd, out);
 		return;
@@ -422,8 +430,11 @@ static void handle_command(app_t *app, const char *cmd, int fd) {
 			}
 		}
 
-		if (app->db_is_neg_inf) apply_db(app, 0, app->min_db);
-		else apply_db(app, 0, app->current_db + step);
+		int is_neg_inf = atomic_load_explicit(&app->db_is_neg_inf, memory_order_relaxed);
+		float current_db = atomic_load_explicit(&app->current_db, memory_order_relaxed);
+
+		if (is_neg_inf) apply_db(app, 0, app->min_db);
+		else apply_db(app, 0, current_db + step);
 
 		send_reply(fd, "OK\n");
 		return;
@@ -442,12 +453,15 @@ static void handle_command(app_t *app, const char *cmd, int fd) {
 			}
 		}
 
-		if (app->db_is_neg_inf) {
+		int is_neg_inf = atomic_load_explicit(&app->db_is_neg_inf, memory_order_relaxed);
+		float current_db = atomic_load_explicit(&app->current_db, memory_order_relaxed);
+
+		if (is_neg_inf) {
 			send_reply(fd, "OK\n");
 			return;
 		}
 
-		float next = app->current_db - step;
+		float next = current_db - step;
 		if (!isinf(app->min_db) && next < app->min_db) next = app->min_db;
 		apply_db(app, 0, next);
 		send_reply(fd, "OK\n");
@@ -519,7 +533,7 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	// detect command mode early
+	/* detect command mode early */
 	if (argc >= 2 &&
 			(strcmp(argv[1], "get") == 0 ||
 			 strcmp(argv[1], "set") == 0 ||
@@ -573,13 +587,15 @@ int main(int argc, char **argv) {
 			cfg.channels = ch;
 			channel_override = true;
 		} else if (strcmp(argv[i], "--min-db") == 0 && i + 1 < argc) {
-			float v; int neg_inf;
+			float v;
+			int neg_inf;
 			if (parse_db_value(argv[++i], &v, &neg_inf) != 0) return 1;
 			cfg.min_db = neg_inf ? -INFINITY : v;
 		} else if (strcmp(argv[i], "--max-db") == 0 && i + 1 < argc) {
 			if (parse_float_str(argv[++i], &cfg.max_db) != 0) return 1;
 		} else if (strcmp(argv[i], "--start-db") == 0 && i + 1 < argc) {
-			float v; int neg_inf;
+			float v;
+			int neg_inf;
 			if (parse_db_value(argv[++i], &v, &neg_inf) != 0) return 1;
 			cfg.start_db = neg_inf ? -INFINITY : v;
 		} else if (strcmp(argv[i], "--step-db") == 0 && i + 1 < argc) {
@@ -603,22 +619,24 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	app_t app = {0};
-	app.running = 1;
-	app.channels = cfg.channels;
-	app.min_db = cfg.min_db;
-	app.max_db = cfg.max_db;
-	app.step_db = cfg.step_db;
-	app.server_fd = -1;
-	snprintf(app.socket_path, sizeof(app.socket_path), "%s", cfg.socket_path);
+	memset(&g_app, 0, sizeof(g_app));
+	g_app.running = 1;
+	g_app.channels = cfg.channels;
+	g_app.min_db = cfg.min_db;
+	g_app.max_db = cfg.max_db;
+	g_app.step_db = cfg.step_db;
+	g_app.server_fd = -1;
+	snprintf(g_app.socket_path, sizeof(g_app.socket_path), "%s", cfg.socket_path);
+
+	atomic_init(&g_app.db_is_neg_inf, 0);
+	atomic_init(&g_app.current_db, 0.0f);
+	atomic_init(&g_app.target_gain, 0.0f);
 
 	if (isinf(cfg.start_db) && cfg.start_db < 0) {
-		set_initial_db(&app, 1, -INFINITY);
+		set_initial_db(&g_app, 1, -INFINITY);
 	} else {
-		set_initial_db(&app, 0, cfg.start_db);
+		set_initial_db(&g_app, 0, cfg.start_db);
 	}
-
-	g_app = app;
 
 	jack_status_t status = 0;
 	g_app.client = jack_client_open(client_name, JackNullOption, &status);
@@ -672,7 +690,9 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, signal_handler);
 
 	char dbbuf[64];
-	format_db(dbbuf, sizeof(dbbuf), g_app.db_is_neg_inf, g_app.current_db);
+	int is_neg_inf = atomic_load_explicit(&g_app.db_is_neg_inf, memory_order_relaxed);
+	float current_db = atomic_load_explicit(&g_app.current_db, memory_order_relaxed);
+	format_db(dbbuf, sizeof(dbbuf), is_neg_inf, current_db);
 	fprintf(stderr,
 			"voljack running: channels=%d volume=%s dB gain=%f socket=%s\n",
 			g_app.channels, dbbuf, g_app.current_gain, g_app.socket_path);
